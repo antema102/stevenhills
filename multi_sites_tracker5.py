@@ -46,7 +46,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional, Set, Tuple
 from pathlib import Path
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
 import traceback
 import time
 import gspread
@@ -1403,13 +1403,12 @@ class MultiSitesOddsTrackerFinal:
             if not values:
                 return None
             
-            from collections import Counter
             counter = Counter(values)
             most_common = counter.most_common(1)
             
             if most_common:
                 return most_common[0][0]
-            return values[0] if values else None
+            return values[0]
         
         return {
             "fullTime": get_majority(full_times),
@@ -1444,7 +1443,6 @@ class MultiSitesOddsTrackerFinal:
                     results.append(site_results[market_key]["result"])
             
             if results:
-                from collections import Counter
                 counter = Counter(results)
                 most_common = counter.most_common(1)
                 consensus[market_key] = most_common[0][0] if most_common else results[0]
