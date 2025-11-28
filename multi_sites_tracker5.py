@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tracker multi-sites - VERSION FINALE AVEC CAPTURE CONTINUE
-─────────────────────────────────────────────────────────
+Tracker multi-sites - VERSION FINALE AVEC CAPTURE CONTINUE + RÉSULTATS AUTOMATIQUES
+─────────────────────────────────────────────────────────────────────────────────
 Fonctionnalités :
 ├─ externalId au lieu de betRadarId (identifiant unique)
 ├─ GetSport avec pagination parallèle (tous les matchs du jour)
@@ -23,10 +23,14 @@ Fonctionnalités :
 ├─ Fuseau horaire Maurice (UTC+4)
 ├─ PERSISTENCE DU CACHE (sauvegarde/restauration sur disque)
 ├─ ANTI DOUBLE-FINALISATION (dédup queue + verrou en cours)
+├─ RÉCUPÉRATION AUTOMATIQUE DES RÉSULTATS (3h après fin match)
+├─ API searchresult + GetMatchData (4 sites en parallèle)
+├─ Score et Résultat par marché (FT/HT/2H)
+├─ Colonnes métadonnées cachées automatiquement
 
 Auteur: antema102
-Date: 2025-11-18
-Version: 2.4 (persistence + anti double finalisation)
+Date: 2025-11-28
+Version: 2.5 (résultats automatiques)
 """
 import sys
 import asyncio
@@ -42,7 +46,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional, Set, Tuple
 from pathlib import Path
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
 import traceback
 import time
 import gspread
@@ -132,6 +136,53 @@ MARKET_SHEET_MAPPING = {
     "HSHH_FT": "HSHH_FT",
 }
 
+# Mapping Score selon le marché (FT/HT/2H)
+SCORE_MAPPING = {
+    # Markets FullTime → Score FT
+    "CP_FT": "FT",
+    "UO_FT_+1.5": "FT",
+    "UO_FT_+2.5": "FT",
+    "UO_FT_+3.5": "FT",
+    "DC_FT": "FT",
+    "BT_FT": "FT",
+    "CS_FT": "FT",
+    "OE_FT": "FT",
+    "HF_FT": "FT",
+    "DB_FT": "FT",
+    "GM_FT": "FT",
+    "WM_FT": "FT",
+    "FS_FT": "FT",
+    "LS_FT": "FT",
+    "HSH_FT": "FT",
+    "HSHA_FT": "FT",
+    "HSHH_FT": "FT",
+    
+    # Markets HalfTime → Score HT
+    "CP_H1": "HT",
+    "UO_H1_+1.5": "HT",
+    "UO_H1_+2.5": "HT",
+    "DC_H1": "HT",
+    "BT_H1": "HT",
+    "CS_H1": "HT",
+    "OE_H1": "HT",
+    "GM_H1": "HT",
+    
+    # Markets 2nd Half → Score 2H
+    "CP_H2": "2H",
+    "UO_H2_+1.5": "2H",
+    "UO_H2_+2.5": "2H",
+    "DC_H2": "2H",
+    "BT_H2": "2H",
+    "CS_H2": "2H",
+    "OE_H2": "2H",
+    "GM_H2": "2H",
+}
+
+# Configuration résultats automatiques
+RESULTS_CHECK_INTERVAL_HOURS = 1        # Check toutes les heures
+RESULTS_DELAY_HOURS = 3                 # Attendre 3h après fin match
+MAX_RESULTS_RETRY = 5                   # Max 5 tentatives
+
 
 class MatchFinalizationQueue:
     """File d'attente pour les matchs à finaliser avec système de priorités"""
@@ -193,6 +244,146 @@ class MatchFinalizationQueue:
 
     def __len__(self):
         return len(self.queue)
+
+
+class MatchResultsQueue:
+    """File d'attente pour récupération résultats avec délai"""
+    
+    def __init__(self, delay_hours: int = 3, max_retries: int = 5):
+        """
+        Initialiser la queue de résultats.
+        
+        Args:
+            delay_hours: Nombre d'heures à attendre après fin estimée du match
+            max_retries: Nombre maximum de tentatives par match
+        """
+        self.queue = deque()
+        self.delay_hours = delay_hours
+        self.max_retries = max_retries
+        self.queued_ids: Set[int] = set()
+    
+    def add_match(self, external_id: int, match_info: dict, estimated_end_time: datetime):
+        """
+        Ajouter un match à la queue (disponible après delay_hours).
+        
+        Args:
+            external_id: ID externe unique du match
+            match_info: Informations du match (métadonnées par site)
+            estimated_end_time: Heure de fin estimée du match
+        """
+        if external_id in self.queued_ids:
+            return  # Déjà en queue
+        
+        ready_time = estimated_end_time + timedelta(hours=self.delay_hours)
+        
+        self.queue.append({
+            "external_id": external_id,
+            "match_info": match_info,
+            "estimated_end_time": estimated_end_time,
+            "ready_time": ready_time,
+            "added_at": now_mauritius(),
+            "retry_count": 0,
+            "last_attempt": None
+        })
+        self.queued_ids.add(external_id)
+    
+    def get_ready_matches(self) -> List[dict]:
+        """
+        Récupérer les matchs prêts (> delay_hours après fin estimée).
+        
+        Returns:
+            Liste des matchs dont les résultats peuvent être récupérés
+        """
+        now = now_mauritius()
+        ready_matches = []
+        
+        for item in list(self.queue):
+            if now >= item["ready_time"]:
+                # Vérifier si pas trop de retries
+                if item["retry_count"] < self.max_retries:
+                    ready_matches.append(item)
+        
+        return ready_matches
+    
+    def mark_completed(self, external_id: int):
+        """
+        Marquer un match comme traité (résultats récupérés).
+        
+        Args:
+            external_id: ID externe du match
+        """
+        self.queue = deque([item for item in self.queue if item["external_id"] != external_id])
+        self.queued_ids.discard(external_id)
+    
+    def increment_retry(self, external_id: int) -> bool:
+        """
+        Incrémenter le compteur de retry et mettre à jour ready_time.
+        
+        Args:
+            external_id: ID externe du match
+            
+        Returns:
+            True si encore des tentatives possibles, False si max atteint
+        """
+        for item in self.queue:
+            if item["external_id"] == external_id:
+                item["retry_count"] += 1
+                item["last_attempt"] = now_mauritius()
+                # Prochain retry dans 1 heure
+                item["ready_time"] = now_mauritius() + timedelta(hours=1)
+                
+                if item["retry_count"] >= self.max_retries:
+                    return False
+                return True
+        return False
+    
+    def mark_failed(self, external_id: int):
+        """
+        Marquer un match comme définitivement échoué (max retries atteint).
+        
+        Args:
+            external_id: ID externe du match
+        """
+        self.queue = deque([item for item in self.queue if item["external_id"] != external_id])
+        self.queued_ids.discard(external_id)
+    
+    def __contains__(self, external_id: int) -> bool:
+        return external_id in self.queued_ids
+    
+    def __len__(self):
+        return len(self.queue)
+    
+    def to_serializable(self) -> List[dict]:
+        """Convertir en format sérialisable pour pickle."""
+        result = []
+        for item in self.queue:
+            serializable_item = item.copy()
+            # Convertir datetime en string
+            for key in ["estimated_end_time", "ready_time", "added_at", "last_attempt"]:
+                if serializable_item.get(key) and isinstance(serializable_item[key], datetime):
+                    serializable_item[key] = serializable_item[key].isoformat()
+            result.append(serializable_item)
+        return result
+    
+    def from_serializable(self, data: List[dict]):
+        """Restaurer depuis format sérialisable."""
+        self.queue.clear()
+        self.queued_ids.clear()
+        
+        for item in data:
+            # Convertir string en datetime
+            for key in ["estimated_end_time", "ready_time", "added_at", "last_attempt"]:
+                if item.get(key) and isinstance(item[key], str):
+                    try:
+                        dt = date_parser.parse(item[key])
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=MAURITIUS_TZ)
+                        item[key] = dt
+                    except:
+                        item[key] = None
+            
+            self.queue.append(item)
+            self.queued_ids.add(item["external_id"])
 
 
 class APIHealthMonitor:
@@ -474,13 +665,26 @@ class GoogleSheetsManager:
             print(f"   🧹 Cache Google Sheets invalidé ({len(self.last_row_cache)} feuilles)")
         self.last_row_cache.clear()
        
-    async def append_rows_batch(self, sheets_data: Dict[str, List[Dict]]):
-        """Utiliser append() avec pauses adaptatives"""
+    async def append_rows_batch(self, sheets_data: Dict[str, List[Dict]], sheets_to_hide_cols: Set[str] = None):
+        """
+        Utiliser append() avec pauses adaptatives.
+        
+        Args:
+            sheets_data: Dict {sheet_name: [row_dicts]}
+            sheets_to_hide_cols: Set des noms de feuilles où masquer les colonnes métadonnées
+        """
         try:
             print(f"\n      📤 Préparation batch ({len(sheets_data)} feuilles)...")
             
             total_rows_sent = 0
             feuilles_traitees = 0
+            
+            # Déterminer l'index de début des colonnes métadonnées
+            # Colonnes: Date, Heure, External ID, Match, Compétition, Heure Match, 
+            #           StevenHills, SuperScore, ToteLePEP, PlayOnline, Score, Résultat,
+            #           MatchId_SH, CompId_SH, SportId_SH, ... (12 colonnes métadonnées)
+            METADATA_START_COL = 12  # Index 0-based: colonnes 12-23 sont les métadonnées
+            NUM_METADATA_COLS = 12   # 4 sites x 3 IDs
             
             for sheet_name, rows in sheets_data.items():
                 if not rows:
@@ -491,6 +695,7 @@ class GoogleSheetsManager:
                     continue
                 
                 expected_header = list(rows[0].keys())
+                header_was_empty = sheet_name not in self.headers_initialized
                 self._ensure_header(worksheet, sheet_name, expected_header)
                 
                 data_to_append = [list(row.values()) for row in rows]
@@ -510,6 +715,16 @@ class GoogleSheetsManager:
                     self._execute_with_retry(append_data, max_retries=2)
                     total_rows_sent += len(data_to_append)
                     feuilles_traitees += 1
+                    
+                    # Masquer les colonnes métadonnées si c'est une nouvelle feuille
+                    # et si elle contient les colonnes métadonnées
+                    if header_was_empty and len(expected_header) > METADATA_START_COL:
+                        # Vérifier si les colonnes métadonnées existent
+                        if any(col.startswith("MatchId_") for col in expected_header):
+                            try:
+                                self.hide_metadata_columns(worksheet, METADATA_START_COL, NUM_METADATA_COLS)
+                            except Exception as e:
+                                print(f"         ⚠️  Erreur masquage colonnes: {e}")
                     
                     # PAUSE ADAPTATIVE
                     if feuilles_traitees % 5 == 0:
@@ -553,8 +768,15 @@ class GoogleSheetsManager:
                 ["Dernière mise à jour", now_mauritius_str()],
                 ["Fuseau horaire", "Indian/Mauritius (UTC+4)"],
                 ["Utilisateur", "antema102"],
-                ["Stratégie", "Capture dynamique + externalId + append() + fix boucle"],
+                ["Stratégie", "Capture dynamique + externalId + append() + résultats auto"],
                 ["Sites", "StevenHills, SuperScore, ToteLePEP, PlayOnline"],
+                [""],
+                ["⚠️  IMPORTANT : Résultats des matchs"],
+                [""],
+                ["✅ Matchs APRÈS déploiement v2.5 : Résultats automatiques (3h après fin)"],
+                ["❌ Matchs AVANT cette date : Cotes uniquement (pas de résultats)"],
+                [""],
+                ["Raison : Métadonnées (MatchId, CompId) ajoutées à partir de cette version"],
                 [""],
                 ["Feuilles disponibles:"],
             ]
@@ -573,6 +795,127 @@ class GoogleSheetsManager:
             
         except Exception as e:
             print(f"   ⚠️ Erreur update summary: {e}")
+    
+    def hide_metadata_columns(self, worksheet: gspread.Worksheet, start_col_index: int, num_cols: int = 12):
+        """
+        Cacher les colonnes métadonnées dans Google Sheets.
+        
+        Args:
+            worksheet: Feuille de calcul Google Sheets
+            start_col_index: Index de la première colonne à cacher (0-indexed)
+            num_cols: Nombre de colonnes à cacher (12 par défaut: 4 sites x 3 IDs)
+        """
+        try:
+            # Utiliser l'API Google Sheets pour masquer les colonnes
+            sheet_id = worksheet.id
+            
+            requests = [{
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": start_col_index,
+                        "endIndex": start_col_index + num_cols
+                    },
+                    "properties": {
+                        "hiddenByUser": True
+                    },
+                    "fields": "hiddenByUser"
+                }
+            }]
+            
+            def batch_update():
+                return self.spreadsheet.batch_update({"requests": requests})
+            
+            self._execute_with_retry(batch_update)
+            print(f"         🙈 {num_cols} colonnes métadonnées cachées")
+            
+        except Exception as e:
+            print(f"         ⚠️  Erreur masquage colonnes: {e}")
+    
+    def update_cell_by_external_id(self, worksheet: gspread.Worksheet, external_id: int, 
+                                    col_name: str, value: str) -> bool:
+        """
+        Mettre à jour une cellule en recherchant par External ID.
+        
+        Args:
+            worksheet: Feuille de calcul
+            external_id: ID externe du match
+            col_name: Nom de la colonne à mettre à jour
+            value: Valeur à écrire
+            
+        Returns:
+            True si mise à jour réussie, False sinon
+        """
+        try:
+            # Récupérer toutes les valeurs
+            def get_all():
+                return worksheet.get_all_values()
+            
+            all_values = self._execute_with_retry(get_all)
+            
+            if not all_values:
+                return False
+            
+            header = all_values[0]
+            
+            # Trouver les indices des colonnes
+            try:
+                external_id_col = header.index("External ID")
+                target_col = header.index(col_name)
+            except ValueError:
+                return False
+            
+            # Trouver la ligne avec cet external_id
+            for row_idx, row in enumerate(all_values[1:], start=2):
+                if len(row) > external_id_col:
+                    try:
+                        if int(row[external_id_col]) == external_id:
+                            # Mettre à jour la cellule
+                            cell_address = gspread.utils.rowcol_to_a1(row_idx, target_col + 1)
+                            
+                            def update_cell():
+                                return worksheet.update(values=[[value]], range_name=cell_address)
+                            
+                            self._execute_with_retry(update_cell)
+                            return True
+                    except (ValueError, TypeError):
+                        continue
+            
+            return False
+            
+        except Exception as e:
+            print(f"         ⚠️  Erreur update cell: {e}")
+            return False
+    
+    def batch_update_cells(self, worksheet: gspread.Worksheet, updates: List[Tuple[int, int, str]]):
+        """
+        Mettre à jour plusieurs cellules en batch.
+        
+        Args:
+            worksheet: Feuille de calcul
+            updates: Liste de tuples (row, col, value) - row et col sont 1-indexed
+        """
+        try:
+            if not updates:
+                return
+            
+            # Préparer les données pour batch_update
+            cell_updates = []
+            for row, col, value in updates:
+                cell_address = gspread.utils.rowcol_to_a1(row, col)
+                cell_updates.append({
+                    "range": cell_address,
+                    "values": [[value]]
+                })
+            
+            def batch_update():
+                return worksheet.batch_update(cell_updates)
+            
+            self._execute_with_retry(batch_update)
+            
+        except Exception as e:
+            print(f"         ⚠️  Erreur batch update cells: {e}")
 
 
 class MultiSitesOddsTrackerFinal:
@@ -626,6 +969,23 @@ class MultiSitesOddsTrackerFinal:
         # Anti double-finalisation
         self.finalizing_in_progress: Set[int] = set()
         
+        # ===== NOUVEAUX: Système de résultats automatiques =====
+        # Queue pour récupération des résultats (avec délai 3h)
+        self.results_queue = MatchResultsQueue(
+            delay_hours=RESULTS_DELAY_HOURS,
+            max_retries=MAX_RESULTS_RETRY
+        )
+        
+        # Set des matchs dont on a déjà récupéré les résultats
+        self.matches_with_results: Set[int] = set()
+        
+        # Archive des métadonnées pour récupération résultats
+        # Structure: {external_id: {site_key: {matchId, competitionId, sportId, ...}}}
+        self.matches_info_archive_for_results: Dict[int, Dict[str, dict]] = {}
+        
+        # Cache des feuilles avec colonnes métadonnées masquées
+        self.sheets_with_hidden_cols: Set[str] = set()
+        
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
         
@@ -662,6 +1022,11 @@ class MultiSitesOddsTrackerFinal:
                 "current_date": self.current_date,
                 "iteration": self.iteration,
                 "finalizing_in_progress": list(self.finalizing_in_progress),
+                # Nouveaux champs pour résultats automatiques
+                "results_queue": self.results_queue.to_serializable(),
+                "matches_with_results": list(self.matches_with_results),
+                "matches_info_archive_for_results": self.matches_info_archive_for_results,
+                "sheets_with_hidden_cols": list(self.sheets_with_hidden_cols),
                 "saved_at": now_mauritius_str(),
             }
             with open(self.state_file, 'wb') as f:
@@ -700,10 +1065,18 @@ class MultiSitesOddsTrackerFinal:
             self.current_date = data.get("current_date", self.current_date)
             self.iteration = int(data.get("iteration", self.iteration))
             self.finalizing_in_progress = set(data.get("finalizing_in_progress") or [])
+            
+            # Restaurer champs résultats automatiques
+            results_queue_data = data.get("results_queue") or []
+            self.results_queue.from_serializable(results_queue_data)
+            self.matches_with_results = set(data.get("matches_with_results") or [])
+            self.matches_info_archive_for_results = data.get("matches_info_archive_for_results") or {}
+            self.sheets_with_hidden_cols = set(data.get("sheets_with_hidden_cols") or [])
 
             # Log résumé
             total_sites_cached = sum(len(s) for s in self.captured_odds.values())
-            print(f"✅ Cache rechargé ({self.state_file.name}) — cotes en cache: {total_sites_cached} sites, matchs suivis: {len(self.matches_info_archive)}")
+            results_pending = len(self.results_queue)
+            print(f"✅ Cache rechargé ({self.state_file.name}) — cotes en cache: {total_sites_cached} sites, matchs suivis: {len(self.matches_info_archive)}, résultats en attente: {results_pending}")
         except Exception as e:
             print(f"❌ Erreur chargement cache : {e}")
     
@@ -835,6 +1208,580 @@ class MultiSitesOddsTrackerFinal:
         
         # Si on arrive ici, toutes les tentatives ont échoué
         return None
+    
+    async def fetch_post(self, url: str, data: dict = None, site_name: str = "") -> Optional[dict]:
+        """
+        Fetch POST avec détection d'erreurs détaillée.
+        
+        Args:
+            url: URL à appeler
+            data: Données form-encoded à envoyer
+            site_name: Nom du site pour les logs
+            
+        Returns:
+            JSON de la réponse ou None si échec
+        """
+        last_error = None
+        headers = HEADERS.copy()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with self.session.post(url, headers=headers, data=data, timeout=TIMEOUT) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    
+                    if resp.status in (429, 500, 502, 503, 504):
+                        last_error = f"HTTP {resp.status}"
+                        if attempt < MAX_RETRIES:
+                            wait = min(2 ** attempt, 5)
+                            await asyncio.sleep(wait)
+                            continue
+                        else:
+                            return None
+                    else:
+                        last_error = f"HTTP {resp.status}"
+                        return None
+            
+            except asyncio.TimeoutError:
+                last_error = f"Timeout ({TIMEOUT}s)"
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(min(2 ** attempt, 5))
+                    continue
+                return None
+            
+            except aiohttp.ClientError as e:
+                last_error = f"ClientError: {type(e).__name__}"
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(min(2 ** attempt, 5))
+                    continue
+                return None
+            
+            except Exception as e:
+                last_error = f"{type(e).__name__}"
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(min(2 ** attempt, 5))
+                    continue
+                return None
+        
+        return None
+    
+    async def fetch_searchresult(self, site_key: str, date: str) -> Optional[dict]:
+        """
+        Appeler POST /webapi/searchresult pour récupérer la liste des matchs terminés.
+        
+        Args:
+            site_key: Clé du site (stevenhills, superscore, etc.)
+            date: Date au format DD/MM/YYYY
+            
+        Returns:
+            JSON de la réponse ou None si échec
+        """
+        base_url = SITES[site_key]["base_url"]
+        url = f"{base_url}/webapi/searchresult"
+        
+        data = {"DateFrom": date}
+        
+        return await self.fetch_post(url, data, SITES[site_key]["name"])
+    
+    async def fetch_getmatchdata(self, site_key: str, match_id: int, sport_id: int, 
+                                  competition_id: int) -> Optional[dict]:
+        """
+        Appeler POST /WebApi/GetMatchData pour récupérer les résultats détaillés par marché.
+        
+        Args:
+            site_key: Clé du site
+            match_id: ID du match sur ce site
+            sport_id: ID du sport (1 pour soccer)
+            competition_id: ID de la compétition sur ce site
+            
+        Returns:
+            JSON de la réponse ou None si échec
+        """
+        base_url = SITES[site_key]["base_url"]
+        url = f"{base_url}/WebApi/GetMatchData"
+        
+        data = {
+            "matchId": match_id,
+            "sportId": sport_id,
+            "competitionId": competition_id
+        }
+        
+        return await self.fetch_post(url, data, SITES[site_key]["name"])
+    
+    def _find_match_in_searchresult(self, search_result: dict, match_id: int) -> Optional[dict]:
+        """
+        Trouver un match dans la réponse searchresult.
+        
+        Args:
+            search_result: Réponse JSON de searchresult
+            match_id: ID du match à chercher
+            
+        Returns:
+            Données du match ou None si non trouvé
+        """
+        if not search_result or not search_result.get("isSuccess"):
+            return None
+        
+        transactions = search_result.get("transaction", [])
+        
+        for country_data in transactions:
+            matches = country_data.get("matches", [])
+            for match in matches:
+                if match.get("matchId") == match_id:
+                    return match
+        
+        return None
+    
+    def _parse_market_results(self, market_data: dict) -> dict:
+        """
+        Parser les résultats de GetMatchData.
+        
+        Args:
+            market_data: Réponse JSON de GetMatchData
+            
+        Returns:
+            Dict avec les résultats par marché {market_key: result}
+        """
+        results = {}
+        
+        if not market_data or not market_data.get("isSuccess"):
+            return results
+        
+        transactions = market_data.get("transaction", [])
+        
+        for market in transactions:
+            market_code = market.get("marketCode", "")
+            period_code = market.get("periodCode", "")
+            line = market.get("line", "")
+            full_time_result = market.get("fullTime", "")
+            
+            # Construire la clé du marché
+            if line:
+                market_key = f"{market_code}_{period_code}_{line}"
+            else:
+                market_key = f"{market_code}_{period_code}"
+            
+            results[market_key] = {
+                "result": full_time_result,
+                "display_name": market.get("marketDisplayName", ""),
+                "market_code": market_code,
+                "period_code": period_code,
+                "line": line
+            }
+        
+        return results
+    
+    def _get_consensus_scores(self, scores_by_site: Dict[str, dict]) -> dict:
+        """
+        Déterminer le consensus des scores (majorité 2/4 ou 3/4).
+        
+        Args:
+            scores_by_site: Dict {site_key: {fullTime, halfTime, secondHalfTime}}
+            
+        Returns:
+            Dict avec les scores consensus {fullTime, halfTime, secondHalfTime}
+        """
+        if not scores_by_site:
+            return {}
+        
+        # Collecter les scores par type
+        full_times = []
+        half_times = []
+        second_half_times = []
+        
+        for site_key, scores in scores_by_site.items():
+            if scores.get("fullTime"):
+                full_times.append(scores["fullTime"])
+            if scores.get("halfTime"):
+                half_times.append(scores["halfTime"])
+            if scores.get("secondHalfTime"):
+                second_half_times.append(scores["secondHalfTime"])
+        
+        def get_majority(values: list) -> Optional[str]:
+            """Retourner la valeur majoritaire ou la première si égalité."""
+            if not values:
+                return None
+            
+            counter = Counter(values)
+            most_common = counter.most_common(1)
+            
+            if most_common:
+                return most_common[0][0]
+            return values[0]
+        
+        return {
+            "fullTime": get_majority(full_times),
+            "halfTime": get_majority(half_times),
+            "secondHalfTime": get_majority(second_half_times)
+        }
+    
+    def _get_consensus_market_results(self, results_by_site: Dict[str, dict]) -> dict:
+        """
+        Déterminer le consensus des résultats par marché.
+        
+        Args:
+            results_by_site: Dict {site_key: {market_key: {result, ...}}}
+            
+        Returns:
+            Dict avec les résultats consensus {market_key: result}
+        """
+        if not results_by_site:
+            return {}
+        
+        # Collecter tous les marchés uniques
+        all_market_keys = set()
+        for site_results in results_by_site.values():
+            all_market_keys.update(site_results.keys())
+        
+        consensus = {}
+        
+        for market_key in all_market_keys:
+            results = []
+            for site_key, site_results in results_by_site.items():
+                if market_key in site_results and site_results[market_key].get("result"):
+                    results.append(site_results[market_key]["result"])
+            
+            if results:
+                counter = Counter(results)
+                most_common = counter.most_common(1)
+                consensus[market_key] = most_common[0][0] if most_common else results[0]
+        
+        return consensus
+    
+    async def fetch_results_for_match(self, external_id: int) -> Optional[dict]:
+        """
+        Récupérer les résultats pour UN match (4 sites en parallèle).
+        
+        Args:
+            external_id: ID externe du match
+            
+        Returns:
+            Dict avec scores et résultats par marché, ou None si non disponible
+        """
+        # Récupérer les métadonnées du match
+        match_metadata = self.matches_info_archive_for_results.get(external_id)
+        
+        if not match_metadata:
+            print(f"      ⚠️  Match {external_id}: Pas de métadonnées pour récupération résultats")
+            return None
+        
+        # Date au format DD/MM/YYYY pour searchresult
+        # Utiliser la date du match depuis les métadonnées
+        first_site_data = list(match_metadata.values())[0]
+        match_start_time = first_site_data.get("start_time", "")
+        
+        try:
+            # Parser la date du match
+            match_dt = date_parser.parse(match_start_time.replace(',', '').strip())
+            search_date = match_dt.strftime("%d/%m/%Y")
+        except:
+            search_date = now_mauritius().strftime("%d/%m/%Y")
+        
+        # ===== ÉTAPE 1: Appeler searchresult pour les 4 sites en parallèle =====
+        search_tasks = []
+        sites_with_metadata = list(match_metadata.keys())
+        
+        for site_key in sites_with_metadata:
+            search_tasks.append(self.fetch_searchresult(site_key, search_date))
+        
+        search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+        
+        # Collecter les scores par site
+        scores_by_site = {}
+        site_match_ids = {}  # Pour GetMatchData
+        
+        for site_key, result in zip(sites_with_metadata, search_results):
+            if isinstance(result, Exception) or not result:
+                continue
+            
+            site_meta = match_metadata[site_key]
+            match_id = site_meta.get("match_id")
+            
+            match_info = self._find_match_in_searchresult(result, match_id)
+            
+            if match_info:
+                scores_by_site[site_key] = {
+                    "fullTime": match_info.get("fullTime", ""),
+                    "halfTime": match_info.get("halfTime", ""),
+                    "secondHalfTime": match_info.get("secondHalfTime", "")
+                }
+                site_match_ids[site_key] = {
+                    "match_id": match_id,
+                    "sport_id": match_info.get("sportId", 1),
+                    "competition_id": match_info.get("competitionId")
+                }
+        
+        if not scores_by_site:
+            print(f"      ⚠️  Match {external_id}: Aucun score trouvé sur les 4 sites")
+            return None
+        
+        # Consensus des scores
+        consensus_scores = self._get_consensus_scores(scores_by_site)
+        
+        print(f"      📊 Match {external_id}: Scores trouvés sur {len(scores_by_site)} site(s)")
+        print(f"         FT: {consensus_scores.get('fullTime', 'N/A')}, HT: {consensus_scores.get('halfTime', 'N/A')}, 2H: {consensus_scores.get('secondHalfTime', 'N/A')}")
+        
+        # ===== ÉTAPE 2: Appeler GetMatchData pour les résultats par marché =====
+        market_tasks = []
+        sites_for_market = []
+        
+        for site_key, ids in site_match_ids.items():
+            task = self.fetch_getmatchdata(
+                site_key,
+                ids["match_id"],
+                ids["sport_id"],
+                ids["competition_id"]
+            )
+            market_tasks.append(task)
+            sites_for_market.append(site_key)
+        
+        market_results = await asyncio.gather(*market_tasks, return_exceptions=True)
+        
+        # Collecter les résultats par marché par site
+        results_by_site = {}
+        
+        for site_key, result in zip(sites_for_market, market_results):
+            if isinstance(result, Exception) or not result:
+                continue
+            
+            parsed = self._parse_market_results(result)
+            if parsed:
+                results_by_site[site_key] = parsed
+        
+        # Consensus des résultats par marché
+        consensus_market_results = self._get_consensus_market_results(results_by_site)
+        
+        print(f"      📋 Match {external_id}: {len(consensus_market_results)} marchés avec résultats")
+        
+        return {
+            "external_id": external_id,
+            "scores": consensus_scores,
+            "market_results": consensus_market_results,
+            "sites_responded": len(scores_by_site)
+        }
+    
+    async def update_results_in_sheets(self, external_id: int, results: dict):
+        """
+        Mettre à jour les résultats dans Google Sheets.
+        
+        Args:
+            external_id: ID externe du match
+            results: Dict avec scores et market_results
+        """
+        scores = results.get("scores", {})
+        market_results = results.get("market_results", {})
+        
+        if not scores and not market_results:
+            return
+        
+        print(f"      📝 Mise à jour Google Sheets pour match {external_id}...")
+        
+        sheets_updated = 0
+        
+        # Pour chaque feuille (marché)
+        for market_key, sheet_name in MARKET_SHEET_MAPPING.items():
+            try:
+                worksheet = self.gsheets.get_or_create_worksheet(sheet_name)
+                if not worksheet:
+                    continue
+                
+                # Déterminer quel score afficher selon le marché
+                score_type = SCORE_MAPPING.get(market_key, "FT")
+                
+                if score_type == "FT":
+                    score_value = scores.get("fullTime", "")
+                elif score_type == "HT":
+                    score_value = scores.get("halfTime", "")
+                elif score_type == "2H":
+                    score_value = scores.get("secondHalfTime", "")
+                else:
+                    score_value = scores.get("fullTime", "")
+                
+                # Résultat du marché
+                result_value = market_results.get(market_key, "")
+                if isinstance(result_value, dict):
+                    result_value = result_value.get("result", "")
+                
+                if not score_value and not result_value:
+                    continue
+                
+                # Mettre à jour les colonnes Score et Résultat
+                success_score = False
+                success_result = False
+                
+                if score_value:
+                    success_score = self.gsheets.update_cell_by_external_id(
+                        worksheet, external_id, "Score", score_value
+                    )
+                
+                if result_value:
+                    success_result = self.gsheets.update_cell_by_external_id(
+                        worksheet, external_id, "Résultat", result_value
+                    )
+                
+                if success_score or success_result:
+                    sheets_updated += 1
+                
+                # Pause anti-quota
+                await asyncio.sleep(2)
+                
+            except Exception as e:
+                print(f"         ⚠️  Erreur mise à jour {sheet_name}: {e}")
+                continue
+        
+        print(f"      ✅ {sheets_updated} feuilles mises à jour")
+    
+    def update_results_in_excel(self, external_id: int, results: dict):
+        """
+        Mettre à jour les résultats dans Excel local.
+        
+        Args:
+            external_id: ID externe du match
+            results: Dict avec scores et market_results
+        """
+        scores = results.get("scores", {})
+        market_results = results.get("market_results", {})
+        
+        if not scores and not market_results:
+            return
+        
+        if not self.local_cumulative_excel.exists():
+            return
+        
+        try:
+            # Lire le fichier Excel
+            excel_sheets = pd.read_excel(
+                self.local_cumulative_excel, 
+                sheet_name=None, 
+                engine='openpyxl'
+            )
+            
+            sheets_modified = False
+            
+            for sheet_name, df in excel_sheets.items():
+                if sheet_name == "Summary":
+                    continue
+                
+                if "External ID" not in df.columns:
+                    continue
+                
+                # Trouver la ligne avec cet external_id
+                mask = df["External ID"] == external_id
+                
+                if not mask.any():
+                    continue
+                
+                # Trouver le market_key correspondant à ce sheet_name
+                market_key = None
+                for mk, sn in MARKET_SHEET_MAPPING.items():
+                    if sn == sheet_name:
+                        market_key = mk
+                        break
+                
+                if not market_key:
+                    # Essayer avec le nom de feuille directement
+                    market_key = sheet_name
+                
+                # Déterminer le score approprié
+                score_type = SCORE_MAPPING.get(market_key, "FT")
+                
+                if score_type == "FT":
+                    score_value = scores.get("fullTime", "")
+                elif score_type == "HT":
+                    score_value = scores.get("halfTime", "")
+                elif score_type == "2H":
+                    score_value = scores.get("secondHalfTime", "")
+                else:
+                    score_value = scores.get("fullTime", "")
+                
+                # Résultat du marché
+                result_value = market_results.get(market_key, "")
+                if isinstance(result_value, dict):
+                    result_value = result_value.get("result", "")
+                
+                # Mettre à jour les colonnes si elles existent
+                if "Score" in df.columns and score_value:
+                    df.loc[mask, "Score"] = score_value
+                    sheets_modified = True
+                
+                if "Résultat" in df.columns and result_value:
+                    df.loc[mask, "Résultat"] = result_value
+                    sheets_modified = True
+                
+                excel_sheets[sheet_name] = df
+            
+            # Réécrire le fichier Excel si modifié
+            if sheets_modified:
+                with pd.ExcelWriter(self.local_cumulative_excel, engine='openpyxl', mode='w') as writer:
+                    for sheet_name, df in excel_sheets.items():
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                
+                print(f"      ✅ Excel local mis à jour pour match {external_id}")
+            
+        except Exception as e:
+            print(f"      ⚠️  Erreur mise à jour Excel: {e}")
+    
+    async def check_and_update_results(self):
+        """
+        Vérifier et mettre à jour les résultats (toutes les heures).
+        Cette fonction est appelée périodiquement pour récupérer les résultats
+        des matchs terminés depuis plus de 3 heures.
+        """
+        ready_matches = self.results_queue.get_ready_matches()
+        
+        if not ready_matches:
+            print(f"\n   📊 Aucun match prêt pour récupération des résultats")
+            return
+        
+        print(f"\n{'='*70}")
+        print(f"📊 RÉCUPÉRATION RÉSULTATS ({len(ready_matches)} matchs prêts)")
+        print(f"{'='*70}")
+        
+        for match_item in ready_matches:
+            external_id = match_item["external_id"]
+            retry_count = match_item["retry_count"]
+            
+            print(f"\n   🔍 Match {external_id} (tentative {retry_count + 1}/{MAX_RESULTS_RETRY})...")
+            
+            try:
+                # Récupérer les résultats
+                results = await self.fetch_results_for_match(external_id)
+                
+                if results and results.get("scores"):
+                    # Mise à jour Google Sheets
+                    await self.update_results_in_sheets(external_id, results)
+                    
+                    # Mise à jour Excel local
+                    self.update_results_in_excel(external_id, results)
+                    
+                    # Marquer comme terminé
+                    self.results_queue.mark_completed(external_id)
+                    self.matches_with_results.add(external_id)
+                    
+                    print(f"   ✅ Match {external_id}: Résultats récupérés et mis à jour")
+                    
+                else:
+                    # Incrémenter retry
+                    can_retry = self.results_queue.increment_retry(external_id)
+                    
+                    if can_retry:
+                        print(f"   ⏳ Match {external_id}: Résultats non disponibles → retry dans 1h")
+                    else:
+                        print(f"   ❌ Match {external_id}: Max tentatives atteint → abandonné")
+                        self.results_queue.mark_failed(external_id)
+                
+                # Pause entre chaque match
+                await asyncio.sleep(5)
+                
+            except Exception as e:
+                print(f"   ❌ Erreur match {external_id}: {e}")
+                self.results_queue.increment_retry(external_id)
+        
+        # Sauvegarder l'état
+        self.save_cache_to_disk(force=True)
+        
+        print(f"\n   📊 Résultats en attente: {len(self.results_queue)} matchs")
     
     
     def _parse_getsport_match_data(self, match_str: str, competitions: dict) -> Optional[dict]:
@@ -1388,9 +2335,13 @@ class MultiSitesOddsTrackerFinal:
                     self.finalization_queue.add_match(external_id, priority)
     
     async def finalize_multiple_matches_batch(self, external_ids: List[int]):
-        """Finaliser plusieurs matchs + gestion matchs sans cotes"""
+        """
+        Finaliser plusieurs matchs + gestion matchs sans cotes.
+        Ajoute les matchs à la queue de résultats pour récupération automatique.
+        """
         
         all_sheets_data = defaultdict(list)
+        matches_to_queue_for_results = []  # Matchs à ajouter à la queue des résultats
         
         for external_id in external_ids:
             # VÉRIFIER D'ABORD LE CACHE
@@ -1443,6 +2394,12 @@ class MultiSitesOddsTrackerFinal:
                 
                 for sheet_name, rows in sheets_data.items():
                     all_sheets_data[sheet_name].extend(rows)
+                
+                # Préparer les données pour la queue de résultats
+                matches_to_queue_for_results.append({
+                    "external_id": external_id,
+                    "matches_info": matches_info.copy()
+                })
             
             except Exception:
                 pass
@@ -1471,6 +2428,32 @@ class MultiSitesOddsTrackerFinal:
                             del self.captured_odds[external_id]
                         if external_id in self.closed_sites:
                             del self.closed_sites[external_id]
+                
+                # ===== NOUVEAU: Ajouter les matchs à la queue des résultats =====
+                for match_data in matches_to_queue_for_results:
+                    external_id = match_data["external_id"]
+                    matches_info = match_data["matches_info"]
+                    
+                    # Stocker les métadonnées pour récupération résultats
+                    self.matches_info_archive_for_results[external_id] = matches_info
+                    
+                    # Calculer l'heure de fin estimée (match + 2h de jeu)
+                    first_match = list(matches_info.values())[0]
+                    start_time_str = first_match.get("start_time", "")
+                    
+                    try:
+                        match_start = date_parser.parse(start_time_str.replace(',', '').strip())
+                        if match_start.tzinfo is None:
+                            match_start = match_start.replace(tzinfo=MAURITIUS_TZ)
+                        estimated_end = match_start + timedelta(hours=2)  # Match dure ~2h
+                    except:
+                        estimated_end = now_mauritius() + timedelta(hours=2)
+                    
+                    # Ajouter à la queue des résultats
+                    if external_id not in self.results_queue:
+                        self.results_queue.add_match(external_id, matches_info, estimated_end)
+                        print(f"      📊 Match {external_id}: Ajouté à la queue résultats (disponible après {estimated_end.strftime('%H:%M')})")
+                
                 # Sauvegarde immédiate après finalisation
                 self.save_cache_to_disk(force=True)
         
@@ -1478,7 +2461,18 @@ class MultiSitesOddsTrackerFinal:
             print(f"      ❌ Erreur finalisation batch: {e}")
     
     def _prepare_sheets_data(self, external_id: int, matches_info: Dict[str, dict]) -> Dict[str, List[Dict]]:
-        """Préparer les données pour Google Sheets"""
+        """
+        Préparer les données pour Google Sheets.
+        
+        Colonnes finales (ordre):
+        - Date, Heure, External ID, Match, Compétition, Heure Match
+        - StevenHills, SuperScore, ToteLePEP, PlayOnline (cotes par site)
+        - Score, Résultat (vides initialement, mis à jour après 3h)
+        - MatchId_SH, CompId_SH, SportId_SH (métadonnées StevenHills)
+        - MatchId_SS, CompId_SS, SportId_SS (métadonnées SuperScore)
+        - MatchId_TP, CompId_TP, SportId_TP (métadonnées ToteLePEP)
+        - MatchId_PO, CompId_PO, SportId_PO (métadonnées PlayOnline)
+        """
         
         first_match = list(matches_info.values())[0]
         
@@ -1489,6 +2483,7 @@ class MultiSitesOddsTrackerFinal:
                     competition_name = site_odds["competition_name"]
                     break
         
+        # Données de base
         base_data = {
             "Date": now_mauritius_str("%Y-%m-%d"),
             "Heure": now_mauritius_str("%H:%M:%S"),
@@ -1504,11 +2499,20 @@ class MultiSitesOddsTrackerFinal:
         
         sheets_data = {}
         
+        # Mapping des sites vers leurs préfixes de colonnes métadonnées
+        site_prefixes = {
+            "stevenhills": "SH",
+            "superscore": "SS",
+            "totelepep": "TP",
+            "playonlineltd": "PO"
+        }
+        
         for market_key in all_market_keys:
             sheet_name = MARKET_SHEET_MAPPING.get(market_key, market_key[:31])
             
             row = base_data.copy()
             
+            # Ajouter les cotes par site
             for site_key in SITES.keys():
                 site_name = SITES[site_key]["name"]
                 
@@ -1522,6 +2526,22 @@ class MultiSitesOddsTrackerFinal:
                         row[site_name] = ""
                 else:
                     row[site_name] = ""
+            
+            # Ajouter colonnes Score et Résultat (vides initialement)
+            row["Score"] = ""
+            row["Résultat"] = ""
+            
+            # Ajouter colonnes métadonnées cachées pour chaque site
+            for site_key, prefix in site_prefixes.items():
+                if site_key in matches_info:
+                    site_match = matches_info[site_key]
+                    row[f"MatchId_{prefix}"] = site_match.get("match_id", "")
+                    row[f"CompId_{prefix}"] = site_match.get("competition_id", "")
+                    row[f"SportId_{prefix}"] = 1  # Soccer = 1
+                else:
+                    row[f"MatchId_{prefix}"] = ""
+                    row[f"CompId_{prefix}"] = ""
+                    row[f"SportId_{prefix}"] = ""
             
             if sheet_name not in sheets_data:
                 sheets_data[sheet_name] = []
@@ -1626,9 +2646,14 @@ class MultiSitesOddsTrackerFinal:
             self.early_closed.clear()
             self.finalizing_in_progress.clear()
             
+            # NOTE: On ne réinitialise PAS results_queue et matches_info_archive_for_results
+            # car les résultats des matchs de la veille peuvent encore être récupérés
+            # (3h+ après la fin du match)
+            
             self.current_date = current_date
             
             print(f"   ✅ Données réinitialisées pour {current_date}")
+            print(f"   📊 Queue résultats conservée : {len(self.results_queue)} matchs en attente")
             print(f"{'='*70}\n")
             # Sauvegarde l'état réinitialisé
             self.save_cache_to_disk(force=True)
@@ -1823,7 +2848,7 @@ class MultiSitesOddsTrackerFinal:
     
     async def run_tracking(self, sport="Soccer", interval_seconds=120):
         print("=" * 70)
-        print("🎯 MULTI-SITES ODDS TRACKER - VERSION FINALE")
+        print("🎯 MULTI-SITES ODDS TRACKER - VERSION FINALE + RÉSULTATS AUTO")
         print("=" * 70)
         print(f"Sites: {', '.join([s['name'] for s in SITES.values()])}")
         print(f"Google Sheets: {GOOGLE_SHEETS_CONFIG['sheet_name']}")
@@ -1834,9 +2859,11 @@ class MultiSitesOddsTrackerFinal:
         print(f"🔄 Capture dynamique: Toutes les 2 min (matchs < 60 min)")
         print(f"📸 Capture avant disparition: Immédiate")
         print(f"🆔 Identifiant: externalId (index 28)")
+        print(f"📊 Résultats: Récupération auto {RESULTS_DELAY_HOURS}h après fin match")
+        print(f"🔁 Check résultats: Toutes les {RESULTS_CHECK_INTERVAL_HOURS}h (iteration % 30)")
         print(f"Fuseau: Maurice (UTC+4)")
         print(f"Utilisateur: antema102")
-        print(f"✅ V2.4: Persistence + anti double finalisation")
+        print(f"✅ V2.5: Résultats automatiques + métadonnées")
         print("=" * 70)
         print()
         
@@ -1903,9 +2930,14 @@ class MultiSitesOddsTrackerFinal:
                 
                 await self.check_matches_for_finalization()
                 
+                # ===== NOUVEAU: Check résultats toutes les heures (30 itérations x 2min = 1h) =====
+                if self.iteration % 30 == 0:
+                    await self.check_and_update_results()
+                
                 print(f"\n   📊 Matchs suivis : {len(self.matches_info_archive)}")
                 print(f"   ✅ Matchs complétés : {len(self.completed_matches)}")
-                print(f"   📦 Queue : {len(self.finalization_queue)} matchs")
+                print(f"   📦 Queue cotes : {len(self.finalization_queue)} matchs")
+                print(f"   📊 Queue résultats : {len(self.results_queue)} matchs")
                 print(f"   💾 Cotes en cache : {sum(len(sites) for sites in self.captured_odds.values())} sites")
 
                 # Rapport santé toutes les 5 itérations
@@ -1929,7 +2961,8 @@ class MultiSitesOddsTrackerFinal:
             # Sauvegarde finale
             self.save_cache_to_disk(force=True)
             print("\n✅ Arrêt du script")
-            print(f"📊 Queue finale : {len(self.finalization_queue)} matchs")
+            print(f"📊 Queue cotes finale : {len(self.finalization_queue)} matchs")
+            print(f"📊 Queue résultats finale : {len(self.results_queue)} matchs")
 
 
 async def main():
@@ -1942,12 +2975,14 @@ async def main():
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("🚀 TRACKER MULTI-SITES - VERSION FINALE")
+    print("🚀 TRACKER MULTI-SITES - VERSION FINALE + RÉSULTATS AUTO")
     print("=" * 70)
     print(f"📅 Date: {now_mauritius_str('%Y-%m-%d')}")
     print(f"🕐 Heure Maurice: {now_mauritius_str()}")
     print(f"👤 Utilisateur: antema102")
-    print(f"✅ V2.4: Persistence + anti double finalisation")
+    print(f"✅ V2.5: Résultats automatiques + métadonnées")
+    print(f"📊 Délai résultats: {RESULTS_DELAY_HOURS}h après fin match")
+    print(f"🔁 Max tentatives: {MAX_RESULTS_RETRY}")
     print("=" * 70)
     print()
     asyncio.run(main())
